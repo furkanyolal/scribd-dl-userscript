@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Scribd Downloader (Searchable PDF)
 // @namespace    https://github.com/furkanyolal/scribd-dl-userscript
-// @version      1.1.0
+// @version      1.1.1
 // @description  Adds a Download PDF button with a progress bar to Scribd document pages. Builds a searchable PDF directly in the browser from the page's own OCR'd content — for documents you're authorized to download.
 // @author       furkanyolal
 // @match        https://www.scribd.com/document/*
@@ -297,12 +297,16 @@
      * each page's source scan image
      */
     async function buildSearchablePdf(pages, images, onProgress) {
+        onProgress?.('Preparing PDF...', 0, 0);
         const { PDFDocument, rgb } = PDFLib;
         const pdfDoc = await PDFDocument.create();
         pdfDoc.registerFontkit(fontkit);
+
+        onProgress?.('Loading font...', 0, 0);
         const fontBytes = await loadUnicodeFont();
         const font = await pdfDoc.embedFont(fontBytes, { subset: true });
 
+        onProgress?.('Building PDF...', 0, pages.length);
         for (let i = 0; i < pages.length; i++) {
             const { width, height, runs } = pages[i];
             const page = pdfDoc.addPage([width, height]);
@@ -365,6 +369,18 @@
 
     // --- UI ---
 
+    // Progress is driven by discrete events (one per page/image/etc.), so
+    // there are brief stretches — e.g. waiting on the last few concurrent
+    // downloads in a batch, one of which needed a retry — where the counter
+    // doesn't move for a couple seconds even though work is still happening.
+    // A subtle pulse keeps the bar visibly "alive" through those gaps
+    // instead of looking frozen.
+    const style = document.createElement('style');
+    style.textContent = `
+        @keyframes scribd-dl-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    `;
+    document.head.appendChild(style);
+
     const ui = document.createElement('div');
     ui.style.cssText = `
         position: fixed; bottom: 24px; right: 24px; z-index: 2147483647;
@@ -399,11 +415,14 @@
         const pct = total ? Math.round((current / total) * 100) : 0;
         statusText.textContent = `${label} ${total ? `${current}/${total}` : ''}`.trim();
         progressInner.style.width = `${pct}%`;
+        progressInner.style.animation = 'scribd-dl-pulse 1.2s ease-in-out infinite';
     }
 
     function resetUI(errorMessage) {
         button.disabled = false;
         button.textContent = '⬇ Download PDF';
+        progressInner.style.animation = 'none';
+        progressInner.style.opacity = '1';
         if (errorMessage) {
             statusText.style.display = 'block';
             statusText.style.color = '#fc8181';
