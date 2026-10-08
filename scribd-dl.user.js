@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Scribd Downloader (Searchable PDF)
 // @namespace    https://github.com/furkanyolal/scribd-dl-userscript
-// @version      1.0.0
+// @version      1.1.0
 // @description  Adds a Download PDF button with a progress bar to Scribd document pages. Builds a searchable PDF directly in the browser from the page's own OCR'd content — for documents you're authorized to download.
 // @author       furkanyolal
 // @match        https://www.scribd.com/document/*
@@ -57,122 +57,151 @@
     }
 
     /**
-     * Force-load every page's content, bypassing the scroll-triggered
-     * IntersectionObserver lazy load.
-     *
-     * Scribd's own per-page loader (`page.load()`) fetches each page's
-     * content via a <script> tag pointing at a JSONP endpoint. Fetching the
-     * same JSONP URL ourselves with real concurrency measured ~12x faster
-     * (1.5s vs ~18s for ~572 pages) — fetch `page.contentUrl` directly,
-     * parse the JSONP wrapper, then feed the HTML into Scribd's own
-     * `_setContainerContents()` (the same method `.load()` ultimately calls)
-     * so layout/positioning stays identical. `loadFonts()` must be called
-     * first — without it the text layer's spans measure as zero-width,
-     * since the glyphs' CSS isn't registered yet.
-     *
-     * Insertion is batched (not one synchronous pass over all ~576 pages)
-     * with a yield between batches — not for raw speed (a focused tab
-     * handles the whole thing in ~1.5s either way) but so the tab stays
-     * responsive and keeps making progress even if it gets backgrounded
-     * mid-run, rather than risking a long unresponsive stretch.
-     *
-     * We deliberately do NOT call display() or trigger the <img> elements'
-     * native src here — we only need the `orig` attribute to compute each
-     * image's URL ourselves (via dm.subImageSrc) and fetch it directly
-     * later, so letting the browser also download every image through the
-     * DOM would fetch ~576 images twice for no benefit. getBoundingClientRect()
-     * on the text layer spans returns identical values with or without
-     * display(), so skipping it doesn't affect text-position extraction.
-     *
-     * Falls back to the native .load() path if Scribd's internal API shape
-     * ever changes underneath us.
+     * The text layer's inline left/top/font-size style values are in a fixed
+     * virtual coordinate space, unrelated to the page's actual rendered
+     * size or zoom. Converting them to true document-pixel coordinates is a
+     * single constant multiplier — measured as exactly 0.2 across multiple
+     * sessions with very different zoom levels (0.77x, 1.51x, 1.68x), so it
+     * isn't zoom-dependent. Still, rather than trust a hardcoded constant
+     * forever, calibrate it from any already-loaded page when one's
+     * available (Scribd always preloads the first couple of pages itself),
+     * falling back to the observed constant otherwise.
      */
-    async function forceLoadAllPages(dm, onProgress) {
+    function deriveTextScale(dm) {
         const pageCount = Object.keys(dm.pages).length;
-        const targets = [];
         for (let n = 1; n <= pageCount; n++) {
             const p = dm.pages[n];
-            if (p && !p.innerPageElem && !p.loadHasStarted) targets.push(n);
+            if (!p?.innerPageElem || !p.origWidth) continue;
+            const dom = document.getElementById('outer_page_' + n);
+            const newpage = dom?.querySelector('.newpage');
+            const span = newpage?.querySelector('.text_layer [class^="ff"] span.a');
+            const inlineLeft = span ? parseFloat(span.style.left) || 0 : 0;
+            if (!newpage || !span || !inlineLeft) continue;
+            const npRect = newpage.getBoundingClientRect();
+            const rect = span.getBoundingClientRect();
+            const outerScale = dm._renderedPageWidth
+                ? dm._renderedPageWidth / p.origWidth
+                : npRect.width / p.origWidth;
+            const scale = (rect.left - npRect.left) / inlineLeft / outerScale;
+            if (scale > 0 && isFinite(scale)) return scale;
         }
-
-        const canFastLoad = targets.length > 0
-            && typeof dm._appendToken === 'function'
-            && typeof dm.pages[targets[0]]?.loadFonts === 'function'
-            && typeof dm.pages[targets[0]]?._setContainerContents === 'function';
-
-        if (!canFastLoad) {
-            const waitUntil = (cond, timeoutMs) => new Promise((resolve) => {
-                const deadline = Date.now() + timeoutMs;
-                const tick = () => {
-                    if (cond() || Date.now() > deadline) return resolve(cond());
-                    setTimeout(tick, 100);
-                };
-                tick();
-            });
-            for (const n of targets) dm.pages[n].load();
-            await waitUntil(() => {
-                let loaded = 0;
-                for (let n = 1; n <= pageCount; n++) if (dm.pages[n]?.innerPageElem) loaded++;
-                onProgress?.('Loading page content...', loaded, pageCount);
-                return loaded === pageCount;
-            }, 60000);
-            return;
-        }
-
-        // Phase 1: fetch every page's content concurrently (network-bound).
-        const htmlByPage = new Map();
-        const CONCURRENCY = 24;
-        let idx = 0;
-        let completed = 0;
-        const fetchOne = async (n, attempts = 3) => {
-            dm.pages[n].loadHasStarted = true;
-            for (let a = 0; a < attempts; a++) {
-                try {
-                    const resp = await fetch(dm._appendToken(dm.pages[n].contentUrl));
-                    const html = parsePageJsonp(await resp.text());
-                    if (html) {
-                        htmlByPage.set(n, html);
-                        return;
-                    }
-                } catch {
-                    // retry below
-                }
-                await new Promise((r) => setTimeout(r, 300 * (a + 1)));
-            }
-            // leave unset on persistent failure; collectPageData skips it
-        };
-        const fetchWorker = async () => {
-            while (idx < targets.length) {
-                await fetchOne(targets[idx++]);
-                completed++;
-                onProgress?.('Loading page content...', completed, targets.length);
-            }
-        };
-        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, targets.length) }, fetchWorker));
-
-        // Phase 2: insert fetched content in batches, yielding between each
-        // so a backgrounded/busy tab can't get stuck unresponsive for long.
-        const RENDER_BATCH_SIZE = 40;
-        onProgress?.('Rendering page content...', 0, targets.length);
-        for (let i = 0; i < targets.length; i += RENDER_BATCH_SIZE) {
-            const batch = targets.slice(i, i + RENDER_BATCH_SIZE);
-            for (const n of batch) {
-                const html = htmlByPage.get(n);
-                if (!html) continue;
-                const p = dm.pages[n];
-                p.loadFonts();
-                p._setContainerContents(html);
-            }
-            onProgress?.('Rendering page content...', Math.min(i + RENDER_BATCH_SIZE, targets.length), targets.length);
-            await new Promise((r) => setTimeout(r, 0));
-        }
+        return 0.2;
     }
 
     /**
-     * Collect each page's source image URL, true dimensions, and OCR'd text
-     * runs (position + font size) directly from the already-fetched content
+     * Fetch every page's content directly and extract its image URL, true
+     * dimensions, and OCR'd text runs — without ever inserting anything
+     * into the live page.
+     *
+     * Scribd's own per-page loader (`page.load()`) fetches content via a
+     * <script> tag pointing at a JSONP endpoint, then renders it straight
+     * into the live DOM. We tried mirroring that (fetch ourselves, but
+     * still insert via Scribd's `_setContainerContents()` for correct
+     * layout) and it looked fast in an isolated test — but at full scale,
+     * back-to-back with no gap, DOM insertion cost escalates badly as more
+     * of the page fills in (89ms → 1.3s → 5.5s → 16s per batch of 40,
+     * confirmed independent of tab focus/throttling). The real fix is
+     * avoiding DOM insertion entirely: parse each page's fetched HTML with
+     * a detached DOMParser (no live layout at all), read the `orig`
+     * attribute and each text span's inline style values directly, and
+     * convert to true coordinates with the fixed scale factor above. No
+     * loadFonts(), no _setContainerContents(), no escalating cost — this
+     * measured ~2s for ~576 pages regardless of how many ran before it.
+     *
+     * Falls back to the native .load() + live-DOM-read path if Scribd's
+     * internal API shape ever changes underneath us.
      */
-    function collectPageData(dm) {
+    async function collectAllPagesFast(dm, onProgress) {
+        const pageCount = Object.keys(dm.pages).length;
+        const canFastLoad = typeof dm._appendToken === 'function'
+            && typeof dm.subImageSrc === 'function';
+        if (!canFastLoad) return null;
+
+        const textScale = deriveTextScale(dm);
+        const pages = new Array(pageCount);
+        const CONCURRENCY = 24;
+        let idx = 1;
+        let completed = 0;
+
+        const collectOne = async (n, attempts = 3) => {
+            const p = dm.pages[n];
+            let html = null;
+            for (let a = 0; a < attempts && !html; a++) {
+                try {
+                    const resp = await fetch(dm._appendToken(p.contentUrl));
+                    html = parsePageJsonp(await resp.text());
+                } catch {
+                    // retry below
+                }
+                if (!html) await new Promise((r) => setTimeout(r, 300 * (a + 1)));
+            }
+            if (!html) {
+                pages[n - 1] = { src: null, width: p.origWidth, height: p.origHeight, runs: [] };
+                return;
+            }
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const img = doc.querySelector('img.absimg');
+            const origAttr = img ? img.getAttribute('orig') : null;
+            const runs = [];
+            doc.querySelectorAll('.text_layer [class^="ff"]').forEach((div) => {
+                const fontSizePx = parseFloat(div.style.fontSize) || 0;
+                div.querySelectorAll('span.a').forEach((span) => {
+                    const text = span.textContent.replace(/\s+/g, ' ');
+                    if (!text.trim()) return;
+                    const inlineLeft = parseFloat(span.style.left) || 0;
+                    const inlineTop = parseFloat(span.style.top) || 0;
+                    runs.push({
+                        text,
+                        x: inlineLeft * textScale,
+                        y: inlineTop * textScale,
+                        fontSize: fontSizePx * textScale,
+                    });
+                });
+            });
+            pages[n - 1] = {
+                src: origAttr ? dm.subImageSrc(origAttr) : null,
+                width: p.origWidth,
+                height: p.origHeight,
+                runs,
+            };
+        };
+        const worker = async () => {
+            while (idx <= pageCount) {
+                await collectOne(idx++);
+                completed++;
+                onProgress?.('Loading page content...', completed, pageCount);
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pageCount) }, worker));
+        return pages;
+    }
+
+    /**
+     * Fallback path: Scribd's own <script>-tag content loader plus a
+     * live-DOM read via getBoundingClientRect(). Slower, but only used if
+     * the internal APIs collectAllPagesFast relies on ever disappear.
+     */
+    async function collectAllPagesSlow(dm, onProgress) {
+        const pageCount = Object.keys(dm.pages).length;
+        const waitUntil = (cond, timeoutMs) => new Promise((resolve) => {
+            const deadline = Date.now() + timeoutMs;
+            const tick = () => {
+                if (cond() || Date.now() > deadline) return resolve(cond());
+                setTimeout(tick, 100);
+            };
+            tick();
+        });
+        for (let n = 1; n <= pageCount; n++) {
+            const p = dm.pages[n];
+            if (p && !p.innerPageElem && !p.loadHasStarted) p.load();
+        }
+        await waitUntil(() => {
+            let loaded = 0;
+            for (let n = 1; n <= pageCount; n++) if (dm.pages[n]?.innerPageElem) loaded++;
+            onProgress?.('Loading page content...', loaded, pageCount);
+            return loaded === pageCount;
+        }, 60000);
+
         const pages = [];
         document.querySelectorAll("div.outer_page_container div[id^='outer_page_']").forEach((dom) => {
             const match = dom.id.match(/outer_page_(\d+)/);
@@ -407,9 +436,8 @@
             setProgress('Finding document viewer...', 0, 0);
             const dm = await waitForDocManager();
 
-            await forceLoadAllPages(dm, setProgress);
-            setProgress('Collecting page content...', 0, 0);
-            const pages = collectPageData(dm);
+            const pages = (await collectAllPagesFast(dm, setProgress))
+                ?? (await collectAllPagesSlow(dm, setProgress));
             if (!pages.length) throw new Error('No pages found on this page.');
 
             const images = await downloadAllImages(pages, setProgress);
